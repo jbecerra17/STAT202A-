@@ -1,0 +1,18 @@
+---
+title: "202A Final Project"
+author: "Joshua Becerra"
+format:
+  html:
+    embed-resources: true
+editor: source
+---
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+library(tidyverse)
+library(broom)
+library(knitr)
+```
+
