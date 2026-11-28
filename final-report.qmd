@@ -14,5 +14,168 @@ editor: source
 library(tidyverse)
 library(broom)
 library(knitr)
+library(nnet)
+library(yardstick)
 ```
 
+
+```{r}
+data <- read.csv("data/raw/plant_health_data.csv")
+glimpse(data)
+```
+```{r}
+# Convert the time stamp to a date
+data <- data %>% mutate(date = ymd_hms(Timestamp))
+```
+
+
+```{r}
+# Want to understand if there are any large deviations in the in soil temperature across the different plants.
+
+ggplot(data, aes(x = factor(Plant_ID), y = Soil_Moisture, fill=factor(Plant_ID))) +
+  geom_boxplot()+
+  labs(x = "Plant ID", y = "Soil Moisture")+
+  theme(legend.position = "none")
+```
+
+```{r}
+ggplot(data = data, aes(x=Plant_Health_Status, fill = Plant_Health_Status, y=Soil_Temperature))+
+  geom_boxplot()+
+  labs(x = "Plant Health Status", y = "Soil Temperature")+
+  scale_fill_manual(values = c("Healthy" = "green", "High Stress" = "Red", "Moderate Stress" = "Blue"))+
+  theme(legend.position = ("none"))
+ 
+
+```
+
+
+
+```{r}
+ggplot(data, aes(x = "", fill = Plant_Health_Status)) +
+  geom_bar(width=1) +
+  coord_polar("y", start=0) +
+  theme_void() + 
+  labs(title = "Health Outcomes in Plants", fill = "Health Status")+
+  scale_fill_manual(values = c("Healthy" = "green", "High Stress" = "Red", "Moderate Stress" = "Blue"))
+```
+
+```{r}
+# Data prep
+plants <- data |>
+  mutate(Plant_Health_Status = factor(Plant_Health_Status,
+                                      levels = c("Healthy", "Moderate Stress", "High Stress"))) |>
+  arrange(Plant_ID, date) |>
+  group_by(Plant_ID) |>
+  mutate(across(Soil_Moisture:Electrochemical_Signal, lag, .names = "{.col}_prev")) |>
+  ungroup() |>
+  drop_na() |>
+  select(-Timestamp, -date)
+
+set.seed(202)
+shuffled <- sample(1:10)
+
+train <- plants |> filter(Plant_ID %in% shuffled[1:8])
+valid <- plants |> filter(Plant_ID == shuffled[9])
+test  <- plants |> filter(Plant_ID == shuffled[10])
+
+```
+
+
+```{r}
+#Models
+null_model <- multinom(Plant_Health_Status ~ 1, data = train, trace = FALSE)
+full_model <- multinom(Plant_Health_Status ~ . - Plant_ID, data = train, trace = FALSE)
+
+forward_aic <- MASS::stepAIC(null_model, scope = formula(full_model),
+                             direction = "forward", k = 2, trace = 0)
+backward_bic <- MASS::stepAIC(full_model, direction = "backward",
+                              k = log(nrow(train)), trace = 0)
+```
+
+```{r}
+forward_aic |> tidy()
+```
+
+```{r}
+backward_bic |> tidy()
+```
+
+```{r}
+#Scoring Models
+get_predictions <- function(model, new_data) {
+  predict(model, newdata = new_data, type = "probs") |>
+    as_tibble() |>
+    mutate(truth = new_data$Plant_Health_Status,
+           predicted = predict(model, newdata = new_data))
+}
+
+plant_metrics <- metric_set(accuracy, precision, recall, f_meas, roc_auc, pr_auc)
+
+results <- bind_rows(
+  forward_aic  |> get_predictions(valid) |> mutate(model = "Forward AIC",  set = "Validation"),
+  backward_bic |> get_predictions(valid) |> mutate(model = "Backward BIC", set = "Validation"),
+  forward_aic  |> get_predictions(test)  |> mutate(model = "Forward AIC",  set = "Test"),
+  backward_bic |> get_predictions(test)  |> mutate(model = "Backward BIC", set = "Test")
+)
+
+results |>
+  group_by(set, model) |>
+  plant_metrics(truth, Healthy:`High Stress`, estimate = predicted, estimator = "macro") |>
+  select(set, model, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate)
+```
+
+```{r}
+results |>
+  filter(set == "Test", model == "Backward BIC") |>
+  conf_mat(truth, predicted) |>
+  autoplot(type = "heatmap")
+```
+```{r}
+#| label: cross-validation
+cv_fold <- function(plant) {
+  fold_train <- train |> filter(Plant_ID != plant)
+  fold_test  <- train |> filter(Plant_ID == plant)
+
+  null_model <- multinom(Plant_Health_Status ~ 1, data = fold_train, trace = FALSE)
+  full_model <- multinom(Plant_Health_Status ~ . - Plant_ID, data = fold_train, trace = FALSE)
+
+  fold_aic <- MASS::stepAIC(null_model, scope = formula(full_model),
+                            direction = "forward", k = 2, trace = 0)
+  fold_bic <- MASS::stepAIC(full_model, direction = "backward",
+                            k = log(nrow(fold_train)), trace = 0)
+
+  bind_rows(
+    fold_aic |> get_predictions(fold_test) |>
+      mutate(model = "Forward AIC", n_vars = length(fold_aic$coefnames) - 1),
+    fold_bic |> get_predictions(fold_test) |>
+      mutate(model = "Backward BIC", n_vars = length(fold_bic$coefnames) - 1)
+  ) |>
+    mutate(held_out_plant = plant)
+}
+
+cv_results <- shuffled[1:8] |> map(cv_fold) |> list_rbind()
+
+cv_results |>
+  group_by(model) |>
+  plant_metrics(truth, Healthy:`High Stress`, estimate = predicted, estimator = "macro") |>
+  select(model, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate)
+```
+
+```{r}
+cv_results |>
+  distinct(held_out_plant, model, n_vars) |>
+  pivot_wider(names_from = model, values_from = n_vars)
+```
+## Final model
+
+$$
+\log\frac{P(\text{Moderate})}{P(\text{Healthy})} = 20.16 - 0.480\,\text{Moisture} - 0.148\,\text{Nitrogen}
+$$
+
+$$
+\log\frac{P(\text{High})}{P(\text{Healthy})} = 29.93 - 0.776\,\text{Moisture} - 0.249\,\text{Nitrogen}
+$$
+
+The final model is a multinomial logistic regression with healthy being the baseline class. Each equation gives the log-odds of a stress level relative to healthy. Higher soil moisture and nitrogen both shift a plant toward being healthy, with stronger effects for high stress than for moderate stress.
