@@ -1,0 +1,162 @@
+---
+title: "植物健康项目补充分析：提前六小时预测"
+output:
+  html_document:
+    mathjax: null
+    md_extensions: -tex_math_dollars
+---
+
+这份补充分析检验队友用 Backward BIC 选出的两个传感器指标，提前六小时能预测得多准。我们保留用当期读数的模型作为对照，再用上一时刻的土壤湿度和氮水平，在相同的训练植物上重新估计系数。
+
+代码参考[队友 Joshua Becerra 的 STAT 202A Quarto 报告](https://github.com/jbecerra17/STAT202A-/blob/707229dfead27d77af0da639cc7ec6929ac00d16/final-report.qmd)，沿用按植物和时间整理数据、按植物划分数据集、多项逻辑回归及六项评估指标的思路。
+
+在 RStudio 打开本文件并点击 **Knit**。代码会读取与本文件同目录的原始 CSV，也支持小组仓库中的 `data/raw/plant_health_data.csv` 路径。
+
+## 构造两个历史特征
+
+先对每株植物按 `Timestamp` 排序。第 `t` 行保留它自己的 `Plant_Health_Status` 作为标签，并取第 `t - 1` 行的两个传感器读数作为输入。每株植物第一条记录没有上一条读数。代码会检查保留的输入与标签确实相隔 6 小时。
+
+```{r prepare-data}
+# 改动：同时支持本地原始 CSV 和队友 Quarto 报告中使用的数据路径。
+data_paths <- c("plant_health_data.csv", "data/raw/plant_health_data.csv")
+data_path <- data_paths[file.exists(data_paths)][1]
+if (is.na(data_path)) stop("Could not find plant_health_data.csv.")
+
+data <- read.csv(data_path)
+health_levels <- c("Healthy", "Moderate Stress", "High Stress")
+data$Plant_Health_Status <- factor(data$Plant_Health_Status, levels = health_levels)
+data$date <- as.POSIXct(data$Timestamp, format = "%Y-%m-%d %H:%M:%OS", tz = "UTC")
+stopifnot(!anyNA(data$date), !anyDuplicated(data[c("Plant_ID", "date")]))
+data <- data[order(data$Plant_ID, data$date), ]
+
+# 改动：仅为原 BIC 选出的两个传感器指标生成滞后值。
+data$Soil_Moisture_prev <- ave(data$Soil_Moisture, data$Plant_ID,
+                             FUN = function(x) c(NA_real_, head(x, -1)))
+data$Nitrogen_Level_prev <- ave(data$Nitrogen_Level, data$Plant_ID,
+                              FUN = function(x) c(NA_real_, head(x, -1)))
+data$hours_since_previous <- ave(as.numeric(data$date), data$Plant_ID,
+                                 FUN = function(x) c(NA_real_, diff(x) / 3600))
+
+required <- c("Plant_Health_Status", "Soil_Moisture", "Nitrogen_Level",
+              "Soil_Moisture_prev", "Nitrogen_Level_prev")
+plants <- data[complete.cases(data[required]), ]
+stopifnot(all(abs(plants$hours_since_previous - 6) < 1e-6))
+```
+
+## 沿用原来的按植物划分
+
+随机种子和 8 / 1 / 1 株的划分与队友一致。两个模型使用相同的训练行，并在完全相同的验证行和测试行上打分。
+
+```{r plant-split}
+set.seed(202)
+shuffled <- sample(1:10)
+train <- subset(plants, Plant_ID %in% shuffled[1:8])
+valid <- subset(plants, Plant_ID == shuffled[9])
+test <- subset(plants, Plant_ID == shuffled[10])
+
+split_summary <- data.frame(
+  Set = c("Training", "Validation", "Test"),
+  Plant_IDs = c(paste(sort(shuffled[1:8]), collapse = ", "), shuffled[9:10]),
+  Rows = c(nrow(train), nrow(valid), nrow(test))
+)
+knitr::kable(split_summary)
+```
+
+## 拟合两个多项逻辑回归
+
+模型都以 `Healthy` 为参照，分别估计 `Moderate Stress` 和 `High Stress` 相对健康状态的对数赔率。当期模型复现队友发布的 BIC 模型公式。历史模型沿用这两个指标，但输入换成它们的上一时刻读数，系数也用训练集重新估计。整个补充分析固定这两个指标。
+
+```{r fit-models}
+# 改动：在共同的训练行上重拟合队友发布的当期 BIC 模型公式。
+current_bic <- nnet::multinom(
+  Plant_Health_Status ~ Soil_Moisture + Nitrogen_Level,
+  data = train, trace = FALSE
+)
+
+# 新增：用两个提前 6 小时的读数重拟合，预测标签仍是本行的健康状态。
+historical_model <- nnet::multinom(
+  Plant_Health_Status ~ Soil_Moisture_prev + Nitrogen_Level_prev,
+  data = train, trace = FALSE
+)
+stopifnot(current_bic$convergence == 0, historical_model$convergence == 0)
+
+knitr::kable(coef(historical_model), digits = 3)
+```
+
+## 在验证植物和测试植物上打分
+
+Accuracy 是预测正确的比例。Macro-Precision、Macro-Recall 和 Macro-F1 分别先算各个类别，再等权平均。若模型从未预测某一类，该类的 Precision 按 0 计。AUROC 和 AUPRC 用预测概率把每一类与其余两类分别比较，再对三个类别平均。AUPRC 使用梯形法计算曲线下面积。
+
+```{r score-models}
+# 沿用队友报告的输出思路：每条记录返回三个类别的预测概率和最终预测类别。
+get_predictions <- function(model, new_data) {
+  probabilities <- predict(model, newdata = new_data, type = "probs")
+  predicted <- predict(model, newdata = new_data)
+  list(truth = new_data$Plant_Health_Status,
+       predicted = factor(predicted, levels = health_levels),
+       probabilities = probabilities[, health_levels, drop = FALSE])
+}
+
+# 改动：用基础 R 实现同样六类评估指标，无需额外安装 yardstick。
+score_predictions <- function(result) {
+  truth <- result$truth
+  counts <- table(truth, result$predicted)
+  true_positive <- diag(counts)
+  precision <- true_positive / pmax(colSums(counts), 1)
+  recall <- true_positive / rowSums(counts)
+  f1 <- 2 * true_positive / (rowSums(counts) + colSums(counts))
+
+  class_areas <- vapply(health_levels, function(class) {
+    positive <- truth == class
+    score <- result$probabilities[, class]
+    n_positive <- sum(positive)
+    n_negative <- length(positive) - n_positive
+    roc <- (sum(rank(score)[positive]) - n_positive * (n_positive + 1) / 2) /
+      (n_positive * n_negative)
+
+    # 先把概率相同的记录分成一组，再计算 PR 曲线下面积。
+    sorted <- order(score, decreasing = TRUE)
+    thresholds <- cumsum(rle(score[sorted])$lengths)
+    cumulative_tp <- cumsum(positive[sorted])[thresholds]
+    pr_recall <- c(0, cumulative_tp / n_positive)
+    pr_precision <- c(1, cumulative_tp / thresholds)
+    pr <- sum(diff(pr_recall) *
+                (head(pr_precision, -1) + tail(pr_precision, -1)) / 2)
+    c(AUROC = roc, AUPRC = pr)
+  }, FUN.VALUE = c(AUROC = 0, AUPRC = 0))
+
+  c(Accuracy = mean(truth == result$predicted),
+    "Macro-Precision" = mean(precision),
+    "Macro-Recall" = mean(recall),
+    "Macro-F1" = mean(f1),
+    rowMeans(class_areas))
+}
+
+# 新增：在相同的验证植物和测试植物上比较两个模型。
+current_valid <- get_predictions(current_bic, valid)
+history_valid <- get_predictions(historical_model, valid)
+current_test <- get_predictions(current_bic, test)
+history_test <- get_predictions(historical_model, test)
+
+scores <- rbind(score_predictions(current_valid), score_predictions(history_valid),
+                score_predictions(current_test), score_predictions(history_test))
+metrics <- data.frame(
+  Set = rep(c("Validation", "Test"), each = 2),
+  Model = rep(c("Current BIC", "Six-hour historical"), times = 2),
+  scores,
+  check.names = FALSE
+)
+knitr::kable(metrics, digits = 3, caption = "验证集和测试集表现")
+```
+
+## 历史模型的测试集混淆矩阵
+
+行是真实类别，列是预测类别。对角线的数字是预测正确的记录数。
+
+```{r historical-confusion-matrix}
+knitr::kable(table(Actual = history_test$truth, Predicted = history_test$predicted))
+```
+
+## 怎么解读
+
+提前六小时预测的测试集准确率为 `r sprintf('%.1f%%', 100 * metrics$Accuracy[4])`，Macro-F1 为 `r sprintf('%.3f', metrics[['Macro-F1']][4])`。历史模型把 `r nrow(test)` 条记录中的 `r sum(history_test$predicted == 'High Stress')` 条判为 `High Stress`。使用当期读数的对照准确率是 `r sprintf('%.1f%%', 100 * metrics$Accuracy[3])`。这两组分数反映的是同一株测试植物在两种读数时间下的表现。

@@ -1,0 +1,162 @@
+---
+title: "Six-Hour Plant Health Prediction Supplement"
+output:
+  html_document:
+    mathjax: null
+    md_extensions: -tex_math_dollars
+---
+
+This supplement asks how well the two sensors selected by the team's Backward BIC model predict plant health six hours ahead. The same-observation model is a reference. The historical model uses the previous soil moisture and nitrogen readings and estimates new coefficients on the same training plants.
+
+The workflow is adapted from [Joshua Becerra’s STAT 202A Quarto report](https://github.com/jbecerra17/STAT202A-/blob/707229dfead27d77af0da639cc7ec6929ac00d16/final-report.qmd), including its chronological grouping, plant split, multinomial regression, and six evaluation metrics.
+
+Open this file in RStudio and click **Knit**. It reads the original CSV either beside this file or at the team repository’s `data/raw/plant_health_data.csv` path.
+
+## Prepare the two historical predictors
+
+For each plant, sort by `Timestamp`. The row at time `t` keeps its own `Plant_Health_Status` label and receives the two sensor readings from time `t - 1`. The first row of each plant has no previous reading. The time-gap check verifies that the retained pairs are six hours apart.
+
+```{r prepare-data}
+# CHANGED: Accept both the local CSV path and the path in the team's Quarto report.
+data_paths <- c("plant_health_data.csv", "data/raw/plant_health_data.csv")
+data_path <- data_paths[file.exists(data_paths)][1]
+if (is.na(data_path)) stop("Could not find plant_health_data.csv.")
+
+data <- read.csv(data_path)
+health_levels <- c("Healthy", "Moderate Stress", "High Stress")
+data$Plant_Health_Status <- factor(data$Plant_Health_Status, levels = health_levels)
+data$date <- as.POSIXct(data$Timestamp, format = "%Y-%m-%d %H:%M:%OS", tz = "UTC")
+stopifnot(!anyNA(data$date), !anyDuplicated(data[c("Plant_ID", "date")]))
+data <- data[order(data$Plant_ID, data$date), ]
+
+# CHANGED: Keep lagged values for the two sensors selected by the original BIC model.
+data$Soil_Moisture_prev <- ave(data$Soil_Moisture, data$Plant_ID,
+                             FUN = function(x) c(NA_real_, head(x, -1)))
+data$Nitrogen_Level_prev <- ave(data$Nitrogen_Level, data$Plant_ID,
+                              FUN = function(x) c(NA_real_, head(x, -1)))
+data$hours_since_previous <- ave(as.numeric(data$date), data$Plant_ID,
+                                 FUN = function(x) c(NA_real_, diff(x) / 3600))
+
+required <- c("Plant_Health_Status", "Soil_Moisture", "Nitrogen_Level",
+              "Soil_Moisture_prev", "Nitrogen_Level_prev")
+plants <- data[complete.cases(data[required]), ]
+stopifnot(all(abs(plants$hours_since_previous - 6) < 1e-6))
+```
+
+## Keep the original split by plant
+
+The seed and 8/1/1 split come from the team report. Both models are trained on the same rows and scored on identical validation and test rows.
+
+```{r plant-split}
+set.seed(202)
+shuffled <- sample(1:10)
+train <- subset(plants, Plant_ID %in% shuffled[1:8])
+valid <- subset(plants, Plant_ID == shuffled[9])
+test <- subset(plants, Plant_ID == shuffled[10])
+
+split_summary <- data.frame(
+  Set = c("Training", "Validation", "Test"),
+  Plant_IDs = c(paste(sort(shuffled[1:8]), collapse = ", "), shuffled[9:10]),
+  Rows = c(nrow(train), nrow(valid), nrow(test))
+)
+knitr::kable(split_summary)
+```
+
+## Fit the two multinomial regressions
+
+With `Healthy` as the reference class, each fit estimates separate log-odds for `Moderate Stress` and `High Stress`. The contemporaneous formula reproduces the published BIC specification. The historical formula keeps the same two sensor types and fits new coefficients using their lagged values. The variable list is fixed throughout this supplement.
+
+```{r fit-models}
+# CHANGED: Refit the team's published Backward BIC formula on the shared training rows.
+current_bic <- nnet::multinom(
+  Plant_Health_Status ~ Soil_Moisture + Nitrogen_Level,
+  data = train, trace = FALSE
+)
+
+# ADDED: Refit with the two six-hour lagged predictors and the same outcome.
+historical_model <- nnet::multinom(
+  Plant_Health_Status ~ Soil_Moisture_prev + Nitrogen_Level_prev,
+  data = train, trace = FALSE
+)
+stopifnot(current_bic$convergence == 0, historical_model$convergence == 0)
+
+knitr::kable(coef(historical_model), digits = 3)
+```
+
+## Evaluate on validation and test plants
+
+Accuracy is the fraction of correct predictions. Macro-precision, macro-recall, and macro-F1 give equal weight to each class. Precision is counted as zero for any class the model never predicts. AUROC and AUPRC are calculated one class versus the rest from the predicted probabilities, then averaged across the three classes. AUPRC uses trapezoidal integration.
+
+```{r score-models}
+# ADAPTED: Return the same class probabilities and predicted labels as the team report.
+get_predictions <- function(model, new_data) {
+  probabilities <- predict(model, newdata = new_data, type = "probs")
+  predicted <- predict(model, newdata = new_data)
+  list(truth = new_data$Plant_Health_Status,
+       predicted = factor(predicted, levels = health_levels),
+       probabilities = probabilities[, health_levels, drop = FALSE])
+}
+
+# CHANGED: Compute the same six metric types in base R so the report can run without yardstick.
+score_predictions <- function(result) {
+  truth <- result$truth
+  counts <- table(truth, result$predicted)
+  true_positive <- diag(counts)
+  precision <- true_positive / pmax(colSums(counts), 1)
+  recall <- true_positive / rowSums(counts)
+  f1 <- 2 * true_positive / (rowSums(counts) + colSums(counts))
+
+  class_areas <- vapply(health_levels, function(class) {
+    positive <- truth == class
+    score <- result$probabilities[, class]
+    n_positive <- sum(positive)
+    n_negative <- length(positive) - n_positive
+    roc <- (sum(rank(score)[positive]) - n_positive * (n_positive + 1) / 2) /
+      (n_positive * n_negative)
+
+    # Group tied scores before integrating the precision–recall curve.
+    sorted <- order(score, decreasing = TRUE)
+    thresholds <- cumsum(rle(score[sorted])$lengths)
+    cumulative_tp <- cumsum(positive[sorted])[thresholds]
+    pr_recall <- c(0, cumulative_tp / n_positive)
+    pr_precision <- c(1, cumulative_tp / thresholds)
+    pr <- sum(diff(pr_recall) *
+                (head(pr_precision, -1) + tail(pr_precision, -1)) / 2)
+    c(AUROC = roc, AUPRC = pr)
+  }, FUN.VALUE = c(AUROC = 0, AUPRC = 0))
+
+  c(Accuracy = mean(truth == result$predicted),
+    "Macro-Precision" = mean(precision),
+    "Macro-Recall" = mean(recall),
+    "Macro-F1" = mean(f1),
+    rowMeans(class_areas))
+}
+
+# ADDED: Compare both models on the same validation and test plants.
+current_valid <- get_predictions(current_bic, valid)
+history_valid <- get_predictions(historical_model, valid)
+current_test <- get_predictions(current_bic, test)
+history_test <- get_predictions(historical_model, test)
+
+scores <- rbind(score_predictions(current_valid), score_predictions(history_valid),
+                score_predictions(current_test), score_predictions(history_test))
+metrics <- data.frame(
+  Set = rep(c("Validation", "Test"), each = 2),
+  Model = rep(c("Current BIC", "Six-hour historical"), times = 2),
+  scores,
+  check.names = FALSE
+)
+knitr::kable(metrics, digits = 3, caption = "Validation and test performance")
+```
+
+## Historical model test confusion matrix
+
+Rows are true labels. Columns are predicted labels. The diagonal counts correct predictions.
+
+```{r historical-confusion-matrix}
+knitr::kable(table(Actual = history_test$truth, Predicted = history_test$predicted))
+```
+
+## Interpretation
+
+For the six-hour prediction task, test accuracy was `r sprintf('%.1f%%', 100 * metrics$Accuracy[4])` and macro-F1 was `r sprintf('%.3f', metrics[['Macro-F1']][4])`. The historical model predicted `High Stress` for `r sum(history_test$predicted == 'High Stress')` of `r nrow(test)` records. The same-observation reference reached `r sprintf('%.1f%%', 100 * metrics$Accuracy[3])` accuracy. These results describe performance under two measurement timings for one held-out plant.
